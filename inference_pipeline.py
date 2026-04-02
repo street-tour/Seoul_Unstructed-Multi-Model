@@ -216,7 +216,7 @@ def run_inference_pipeline():
     query = """
         SELECT a.*, b.filepath
         FROM AI_PROC_PREVALUE a
-        JOIN AI_VISION DAVALUE b ON a.LOTID = b.LOTID
+        JOIN AI_VISION_DAVALUE b ON a.LOTID = b.LOTID
         WHERE a.ISERROR IS NULL OR a.ISERROR = ''
         LIMIT 100
     """
@@ -236,7 +236,7 @@ def run_inference_pipeline():
 
     X_test_df = df[feature_cols].select_dtypes(include=[np.number])
     new_tabular_data = X_test_df.values
-    num_features = len(feature_cols)
+    num_features = X_test_df.shape[1]
 
     new_image_paths = df['filepath'].tolist()
     lot_ids = df['LOTID'].tolist()
