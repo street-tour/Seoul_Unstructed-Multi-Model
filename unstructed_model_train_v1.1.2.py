@@ -1,11 +1,13 @@
 import os
 import time
+import sys
 import pandas as pd
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
 import matplotlib.pyplot as plt
+import multiprocessing
 from torch.utils.data import DataLoader, Dataset
 from sqlalchemy import create_engine, text
 from dotenv import load_dotenv
@@ -15,10 +17,13 @@ from PIL import Image
 import random
 import re
 import joblib
+import traceback
+from tqdm import tqdm
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import recall_score, precision_score, confusion_matrix
 from sklearn.preprocessing import StandardScaler
 from torch.cuda.amp import autocast, GradScaler
+from torch.optim.lr_scheduler import ReduceLROnPlateau
 import urllib.parse
 
 
@@ -26,9 +31,27 @@ import urllib.parse
 unstructed_model_train_v1.1.py 에서 feature importance가 너무 높았던
 'WELD_CURR_VAR', 'WELD_CURR_MAX' 두 개의 컬럼을 제외하고 학습 시킨 코드
 
-+ 이미지에 초점을 둬서 학습을 진행하기 때문에, 이미지 중 30%는 가린채로 학습을 진행
++ 이미지에 초점을 둬서 학습을 진행하기 때문에, 이미지 중 10%는 가린채로 학습을 진행
 + 학습률(LR)을 분리시켜, 비전 모델은 미세 조정, 탭 모델은 보폭을 크게 집중학습
+
++ Focal Loss, MLP 경량화, 시력 저하 10% 조정, 스케쥴러 추가
+
++ exe 파일로 감싸서 모델 학습이 정상적으로 종료되면 0을 반환, 실패 시 1을 반환하는 로직 추가
 """
+
+# Focal Loss 정의 (확률 뭉침 해결용)
+class FocalLoss(nn.Module):
+    def __init__(self, pos_weight=None, gamma=2.0):
+        super(FocalLoss, self).__init__()
+        # reduction='none'으로 설정하여 각 샘플별로 Loss를 구한 뒤 가중치를 곱함
+        self.bce = nn.BCEWithLogitsLoss(pos_weight=pos_weight, reduction='none')
+        self.gamma = gamma
+
+    def forward(self, inputs, targets):
+        bce_loss = self.bce(inputs, targets)
+        pt = torch.exp(-bce_loss)
+        focal_loss = (1 - pt) ** self.gamma * bce_loss
+        return focal_loss.mean()
 
 class MultimodalDataset(Dataset):
     def __init__(self, image_paths, tabular_data, labels, transform=None):
@@ -53,7 +76,7 @@ class MultimodalDataset(Dataset):
         else:
             image_tensor = transforms.ToTensor()(image)
 
-        if self.transform is not None and random.random() < 0.15:
+        if self.transform is not None and random.random() < 0.10:
             image_tensor = torch.zeros_like(image_tensor)
 
         return image_tensor, self.tabular_data[idx], self.labels[idx]
@@ -64,17 +87,18 @@ class MultimodalFusionModel(nn.Module):
         self.vision_model = models.resnet18(weights=models.ResNet18_Weights.IMAGENET1K_V1)
         self.vision_model.fc = nn.Identity()
 
+        # 정형 데이터 노이즈 방지를 위한 Tabular MLP 경량화 및 Dropout 축소
         self.tabular_model = nn.Sequential(
-            nn.Linear(num_tabular_features, 128),
-            nn.BatchNorm1d(128),
+            nn.Linear(num_tabular_features, 64),
+            nn.BatchNorm1d(64),
             nn.ReLU(),
-            nn.Dropout(0.3),
-            nn.Linear(128, 64),
+            nn.Dropout(0.1),
+            nn.Linear(64, 32),
             nn.ReLU()
         )
 
         self.classifier = nn.Sequential(
-            nn.Linear(512 + 64, 128),
+            nn.Linear(512 + 32, 128),
             nn.ReLU(),
             nn.Dropout(0.3),
             nn.Linear(128, 1)
@@ -92,23 +116,23 @@ class DefectDetectionTrainer:
         self.engine = db_engine
         self.scaler = StandardScaler()
 
-    def get_next_sequence(self):
-        """DB를 조회하여 UNSTRUCTED_MODEL_N 형태의 다음 번호를 생성"""
-        try:
-            query = "SELECT TRAINID FROM AI_UNSTRUCTED_TRAIN_INFO ORDER BY DATIME DESC LIMIT 1"
-            df = pd.read_sql(query, self.engine)
-            if df.empty:
-                return "UNSTRUCTED_MODEL_1"
+    # def get_next_sequence(self):
+    #     """DB를 조회하여 UNSTRUCTED_MODEL_N 형태의 다음 번호를 생성"""
+    #     try:
+    #         query = "SELECT TRAINID FROM AI_UNSTRUCTED_TRAIN_INFO ORDER BY DATIME DESC LIMIT 1"
+    #         df = pd.read_sql(query, self.engine)
+    #         if df.empty:
+    #             return "UNSTRUCTED_MODEL_1"
             
-            last_id = df.iloc[0]['TRAINID']
-            match = re.search(f'\d+', last_id)
-            if match:
-                next_num = int(match.group()) + 1
-                return f"UNSTRUCTED_MODEL_{next_num}"
-            else:
-                return "UNSTRUCTED_MODEL_1"
-        except Exception as e:
-            return 
+    #         last_id = df.iloc[0]['TRAINID']
+    #         match = re.search(f'\d+', last_id)
+    #         if match:
+    #             next_num = int(match.group()) + 1
+    #             return f"UNSTRUCTED_MODEL_{next_num}"
+    #         else:
+    #             return "UNSTRUCTED_MODEL_1"
+    #     except Exception as e:
+    #         return 
 
     def load_data_from_db(self):
         """DB에서 데이터를 가져와 학습/검증 데이터로 분리"""
@@ -144,7 +168,7 @@ class DefectDetectionTrainer:
 
         return (X_tab_train, X_tab_test, y_train, y_test, img_train, img_test), len(feature_cols)
     
-    def train_and_evaluate(self, data_splits, num_features, epochs=100):
+    def train_and_evaluate(self, data_splits, num_features, model_name, epochs=100):
         """모델을 학습하고 검증 데이터로 Recall을 계산합니다"""
         X_tab_train, X_tab_test, y_train, y_test, img_train, img_test = data_splits
 
@@ -170,10 +194,10 @@ class DefectDetectionTrainer:
         ])
 
         train_dataset = MultimodalDataset(img_train, X_tab_train_scaled, y_train, transform=train_transforms)
-        train_loader = DataLoader(train_dataset, batch_size=64, shuffle=True, num_workers=4, pin_memory=True)
+        train_loader = DataLoader(train_dataset, batch_size=64, shuffle=True, num_workers=0, pin_memory=True)
 
         test_dataset = MultimodalDataset(img_test, X_tab_test_scaled, y_test, transform=test_transforms)
-        test_loader = DataLoader(test_dataset, batch_size=64, shuffle=False, num_workers=4, pin_memory=True)
+        test_loader = DataLoader(test_dataset, batch_size=64, shuffle=False, num_workers=0, pin_memory=True)
 
         # 모델 및 데이터로더 초기화
         model = MultimodalFusionModel(num_tabular_features=num_features).to(self.device)
@@ -198,17 +222,23 @@ class DefectDetectionTrainer:
             {'params': classifier_params, 'lr': 1e-4}   # 분류기: 중간 밸런스 유지
         ], weight_decay=1e-4)
 
+        # 검증 손실이 떨어지지 않을 때 학습률을 낮춰주는 스케쥴러 도입
+        scheduler = ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=2, verbose=True)
+
         # AMP Scaler 초기화
         scaler = GradScaler()
 
         start_time = time.time()
-        print(f"모델 학습을 시작합니다. (Device: {self.device}, Epochs: {epochs}, Class Weight: {weight_ratio:.2f})")
+        print(f"모델 학습을 시작합니다. (Device: {self.device}, Model: {model_name}, Epochs: {epochs}, Class Weight: {weight_ratio:.2f})")
 
         # Early Stopping
         best_val_loss = float('inf')
         patience = 5
         patience_counter = 0
-        best_model_path = "best_fusion_model_10000_v2.pt"
+
+
+        best_model_path = f"{model_name}.pt"
+        best_scaler_path = f"{model_name}_scaler.pkl"
 
         # 매 에포크의 Recall을 추적할 리스트
         val_recalls = []
@@ -217,13 +247,14 @@ class DefectDetectionTrainer:
             # --- 학습(Train) 루프 ---
             model.train()
             train_loss = 0.0
-            for images, tabs, targets in train_loader:
+            
+            for step, (images, tabs, targets) in enumerate(train_loader):
                 images, tabs, targets = images.to(self.device), tabs.to(self.device), targets.to(self.device)
 
                 optimizer.zero_grad()
 
                 # autocast 블록 안에서 순전파 및 Loss 연산 진행
-                with autocast():
+                with torch.amp.autocast('cuda'):
                     outputs = model(images, tabs)
                     loss = criterion(outputs, targets)
                 
@@ -233,7 +264,11 @@ class DefectDetectionTrainer:
                 scaler.update()
 
                 train_loss += loss.item()
-            
+
+                # [안전한 로깅] 50 배치마다 텍스트 출력
+                if (step + 1) % 50 == 0:
+                    print(f" -> [진행 중] Epoch {epoch+1} - 배치 [{step+1}/{len(train_loader)}] Loss: {loss.item():.4f}")
+
             avg_train_loss = train_loss / len(train_loader)
 
             # --- 검증(Validation) 루프 ---
@@ -254,6 +289,8 @@ class DefectDetectionTrainer:
                     epoch_actuals.extend(targets.cpu().numpy().flatten())
             
             avg_val_loss = val_loss / len(test_loader)
+
+            scheduler.step(avg_val_loss)
 
             epoch_recall = recall_score(epoch_actuals, epochs_preds, zero_division=0)
             val_recalls.append(epoch_recall)
@@ -292,7 +329,7 @@ class DefectDetectionTrainer:
                 actuals.extend(targets.cpu().numpy().flatten())
 
         end_time = time.time()
-        train_duration = f"{end_time - start_time:.2f}s"
+        train_duration = round(end_time - start_time, 2)
 
         # 실제 불량을 얼마나 잘 찾아냈는지 Recall 계산
         recall = recall_score(actuals, predictions, zero_division=0)
@@ -301,12 +338,11 @@ class DefectDetectionTrainer:
         print(f"\n[검증 결과]")
         print(f"Recall (재현율): {recall:.4f}")
         print(f"Precision (정밀도): {precision:.4f}") # 0 근처라면 모델이 모든걸 다 불량이라고 찍은 것입니다
-        print(f"학습 소요 시간: {train_duration}")
+        print(f"학습 소요 시간: {train_duration}초")
 
-        joblib.dump(self.scaler, 'best_fusion_scaler_10000_v2.pkl')
+        joblib.dump(self.scaler, best_scaler_path)
 
-        seq_name = self.get_next_sequence()
-        self.save_recall_plot(val_recalls, seq_name)
+        self.save_recall_plot(val_recalls, model_name)
 
         return recall, train_duration
     
@@ -333,29 +369,63 @@ class DefectDetectionTrainer:
         plt.close()  # 메모리 해제
         print(f"=> Recall 추이 그래프 생성 완료: {file_name}")
 
+    def save_metric_to_db(self, train_id, model_name, datime_str, train_duration, recall):
+        # 생성된 TRAINID와 MODELNAME을 DB에 저장
+        try:
+            query = text("""
+                INSERT INTO AI_UNSTRUCTED_TRAIN_INFO (TRAINID, MODELNAME, DATIME, TRAINTIME, RECALL)
+                VALUES (:train_id, :model_name, :datime, :train_duration, :recall)             
+            """)
+            with self.engine.begin() as conn:
+                conn.execute(query, {
+                    "train_id": train_id,
+                    "model_name": model_name,
+                    "datime": datime_str,
+                    "train_duration": float(train_duration),
+                    "recall": float(recall)
+                })
+            print(f"=> DB 저장 완료 | TRAINID: {train_id}, RECALL: {recall:.4f}, MODELNAME: {model_name}")
+        except Exception as e:
+            print(f"DB 저장 중 오류 발생: {e}")
+
 def run_pipeline():
-    load_dotenv()
-    DB_USER = os.getenv("DB_USER")
-    DB_PASSWORD = os.getenv("DB_PASSWORD")
-    DB_HOST = os.getenv("DB_HOST")
-    DB_PORT = os.getenv("DB_PORT")
-    DB_NAME = os.getenv("DB_NAME")
+    try:
+        load_dotenv()
+        DB_USER = os.getenv("DB_USER")
+        DB_PASSWORD = os.getenv("DB_PASSWORD")
+        DB_HOST = os.getenv("DB_HOST")
+        DB_PORT = os.getenv("DB_PORT")
+        DB_NAME = os.getenv("DB_NAME")
 
-    safe_password = urllib.parse.quote_plus(DB_PASSWORD)
+        safe_password = urllib.parse.quote_plus(DB_PASSWORD)
 
-    db_url = f"mysql+pymysql://{DB_USER}:{safe_password}@{DB_HOST}:{DB_PORT}/{DB_NAME}"
-    engine = create_engine(db_url)
+        db_url = f"mysql+pymysql://{DB_USER}:{safe_password}@{DB_HOST}:{DB_PORT}/{DB_NAME}"
+        engine = create_engine(db_url)
 
-    trainer = DefectDetectionTrainer(engine)
+        now = datetime.now()
+        train_id = now.strftime("%y%m%d-%H%M")
+        model_name = f"{train_id}-multi"
+        datime_str = now.strftime("%Y-%m-%d %H:%M:%S.000")
 
-    # 데이터 로드 및 분리
-    data_splits, num_features = trainer.load_data_from_db()
+        trainer = DefectDetectionTrainer(engine)
 
-    # 모델 학습 및 재현율 도출
-    recall, train_duration = trainer.train_and_evaluate(data_splits, num_features)
+        # 데이터 로드 및 분리
+        data_splits, num_features = trainer.load_data_from_db()
 
-    # 결과를 DB에 저장
-    trainer.save_metric_to_db(recall, train_duration)
+        # 모델 학습 및 재현율 도출
+        recall, train_duration = trainer.train_and_evaluate(data_splits, num_features, model_name)
+
+        # 결과를 DB에 저장
+        trainer.save_metric_to_db(train_id, model_name, datime_str, train_duration, recall)
+
+        print("\n [SUCCESS] 모델 학습 파이프라인이 정상적으로 완료되었습니다.")
+        sys.exit(0)
+    
+    except Exception as e:
+        print(f"\n [ERROR] 학습 파이프라인 실행 중 오류가 발생했습니다: {e}")
+        traceback.print_exc()
+        sys.exit(1)
 
 if __name__ == "__main__":
+    multiprocessing.freeze_support()
     run_pipeline()
